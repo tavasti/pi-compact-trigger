@@ -1,0 +1,14 @@
+{
+  "name": "pi-compact-trigger",
+  "version": "0.1.0",
+  "description": "Headroom-based compaction trigger for Pi — compact when X tokens of headroom remain",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "compaction", "context-window", "headroom"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["extensions/compact-trigger/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0"
+  },
+  "files": ["extensions/**", "README.md", "package.json"]
+}

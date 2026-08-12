@@ -1,0 +1,6 @@
+{
+  "_description": "Headroom-based compaction trigger. Compaction fires when usedTokens > contextWindow - headroomTokens.",
+  "_note": "The global value is used for any model not explicitly listed. Use * for pattern matching in model keys.",
+  "headroomTokens": 20000,
+  "models": {}
+}
