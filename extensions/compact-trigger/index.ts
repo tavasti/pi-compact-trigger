@@ -4,9 +4,12 @@
  * Headroom-based compaction trigger: "compact when X tokens of headroom remain"
  * instead of percentage-based thresholds. One setting works across all models.
  *
- * At agent_end, if usedTokens > contextWindow - headroomTokens, inflate
- * lastAssistant.usage.totalTokens past the context window. Pi's internal
+ * At turn_end (after every assistant message), if usedTokens > contextWindow - headroomTokens,
+ * inflate lastAssistant.usage.totalTokens past the context window. Pi's internal
  * compaction check then fires its normal pipeline, preserving the full native UX.
+ *
+ * Uses compactionEntry.tokensFrom session_compact for accurate reporting.
+ * Only shows stats when the plugin itself triggered the compaction (fromExtension === true).
  *
  * Requires compaction.enabled: true in settings.json.
  * Requires blackhole extension for VCC summaries (optional, uses pi-default without it).
@@ -15,7 +18,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_HEADROOM = 20000;
@@ -113,17 +116,6 @@ function getHeadroom(config: CompactConfig, modelId: string): number {
     return config.headroomTokens;
 }
 
-function findLastAssistantMessage(messages: unknown[]): any | undefined {
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const msg = messages[i] as any;
-        if (!msg || msg.role !== "assistant") continue;
-        if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
-        if (!msg.usage) continue;
-        return msg;
-    }
-    return undefined;
-}
-
 function formatNotification(count: number, maxTokens: number, avgTokens: number, contextWindow: number): string {
     return `compact: ${count}x, max ${maxTokens.toLocaleString()} / avg ${Math.round(avgTokens).toLocaleString()} of ${contextWindow.toLocaleString()}`;
 }
@@ -133,7 +125,6 @@ export default function (pi: ExtensionAPI) {
 
     let lastCompactionMs = 0;
     let lastNudgeMs = 0;
-    let lastAssistantMessageRef: any | undefined;
     let sessionId: string | undefined;
 
     // Pending stats for notification after compaction
@@ -143,30 +134,35 @@ export default function (pi: ExtensionAPI) {
 
     pi.on("session_start", async (_event, ctx) => {
         sessionId = ctx.sessionManager.getSessionId();
-        lastAssistantMessageRef = undefined;
         lastCompactionMs = 0;
         lastNudgeMs = 0;
         pendingStats = undefined;
     });
 
     pi.on("session_tree", async (_event, _ctx) => {
-        lastAssistantMessageRef = undefined;
         lastNudgeMs = 0;
         pendingStats = undefined;
     });
 
-    pi.on("session_before_compact", async (_event, _ctx) => {
-        lastAssistantMessageRef = undefined;
-        lastNudgeMs = 0;
-    });
-
-    pi.on("session_compact", async (_event, ctx) => {
+    pi.on("session_compact", async (event, ctx) => {
         lastCompactionMs = Date.now();
-        lastAssistantMessageRef = undefined;
         lastNudgeMs = 0;
 
-        if (pendingStats && ctx.hasUI) {
-            try {
+        const fromExtension = (event as any)?.fromExtension ?? false;
+        const compactionEntry = (event as any)?.compactionEntry;
+
+        if (!ctx.hasUI) {
+            pendingStats = undefined;
+            return;
+        }
+
+        try {
+            if (fromExtension && pendingStats) {
+                // This compaction was triggered by THIS plugin — use our own token count
+                // captured at trigger time. Do NOT use compactionEntry.tokensBefore here,
+                // because by the time session_compact fires, the context has been inflated
+                // to ctx+1 (the plugin forced it), so tokensBefore is artificially high.
+                const tokensBefore = pendingStats.maxTokens;
                 const avg = pendingStats.count > 0
                     ? pendingStats.totalTokens / pendingStats.count
                     : 0;
@@ -174,29 +170,37 @@ export default function (pi: ExtensionAPI) {
                     "compact-trigger",
                     formatNotification(
                         pendingStats.count,
-                        pendingStats.maxTokens,
+                        tokensBefore,
                         avg,
                         pendingStats.contextWindow,
                     ),
                 );
-            } catch {
-                // ignore UI errors
+            } else if (!fromExtension) {
+                // Overflow compaction (not triggered by us) — use what Pi reports
+                const tokensBefore = compactionEntry?.tokensBefore;
+                if (tokensBefore) {
+                    ctx.ui.setStatus(
+                        "compact-trigger",
+                        `compact: overflow at ${tokensBefore.toLocaleString()} tokens`,
+                    );
+                }
             }
+        } catch {
+            // ignore UI errors
         }
         pendingStats = undefined;
     });
 
-    // Capture the last assistant message reference
-    pi.on("turn_end", async (event, _ctx) => {
+    // Main trigger logic — runs after EVERY assistant message (including tool-use responses).
+    // Previously used agent_end which only fires when the agent loop exits.
+    // With agent_end, tool-use responses (stopReason: "toolUse") were never checked because
+    // the loop continued to execute tools and agent_end never fired for that turn.
+    pi.on("turn_end", async (event, ctx) => {
         const msg = (event as any)?.message;
         if (!msg || msg.role !== "assistant") return;
         if (msg.stopReason === "error" || msg.stopReason === "aborted") return;
-        if (!msg.usage) return;
-        lastAssistantMessageRef = msg;
-    });
+        if (!msg.usage?.totalTokens) return;
 
-    // Main trigger logic
-    pi.on("agent_end", async (event, ctx) => {
         const now = Date.now();
         if (now - lastCompactionMs < COMPACTION_COOLDOWN_MS) {
             return;
@@ -209,14 +213,7 @@ export default function (pi: ExtensionAPI) {
         const headroom = getHeadroom(config, model.id);
         const threshold = contextWindow - headroom;
 
-        // Get actual token usage from the last assistant message
-        const lastAssistant =
-            lastAssistantMessageRef ??
-            findLastAssistantMessage((event as any)?.messages ?? []);
-
-        if (!lastAssistant?.usage?.totalTokens) return;
-
-        const usedTokens = lastAssistant.usage.totalTokens;
+        const usedTokens = msg.usage.totalTokens;
 
         if (usedTokens < threshold) return;
 
@@ -227,7 +224,7 @@ export default function (pi: ExtensionAPI) {
 
         // Inflate tokens to force Pi's shouldCompact() to return true
         const forcedTokens = contextWindow + 1;
-        lastAssistant.usage.totalTokens = Math.max(lastAssistant.usage.totalTokens, forcedTokens);
+        msg.usage.totalTokens = Math.max(msg.usage.totalTokens, forcedTokens);
 
         if (!sessionId) return;
 
