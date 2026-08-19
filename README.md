@@ -1,5 +1,8 @@
 # pi-compact-trigger
 
+***This is coded after misconfiguring and misunderstanding how pi compation works. Only valid use for this expansion is if you want to have different headroom for some models ***
+
+
 Headroom-based compaction trigger for [Pi](https://github.com/earendil-works/pi-coding-agent), designed to work with the [blackhole](https://github.com/tavasti/pi-blackhole) VCC compaction engine.
 
 Blackhole uses a single static token threshold to decide when to compact. That works fine with one model, but breaks when you switch between models with different context sizes — a threshold that's safe for 84k context triggers way too early for 256k context. 

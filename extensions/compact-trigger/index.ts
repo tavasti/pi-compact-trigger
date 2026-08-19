@@ -8,14 +8,19 @@
  * inflate lastAssistant.usage.totalTokens past the context window. Pi's internal
  * compaction check then fires its normal pipeline, preserving the full native UX.
  *
- * Uses compactionEntry.tokensFrom session_compact for accurate reporting.
- * Only shows stats when the plugin itself triggered the compaction (fromExtension === true).
+ * Uses ctx.getContextUsage() for context estimation (same as pi-model-aware-compaction).
+ * Uses session_before_compact preparation.tokensBefore for accurate stats reporting.
  *
  * Requires compaction.enabled: true in settings.json.
  * Requires blackhole extension for VCC summaries (optional, uses pi-default without it).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+    buildSessionContext,
+    estimateTokens,
+    type ExtensionAPI,
+    type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -38,12 +43,49 @@ interface CompactStats {
     totalTokens: number;
 }
 
+interface InflationRecord {
+    sessionId: string;
+    offset: number;
+}
+
 const DEFAULT_STATS: Omit<CompactStats, "modelId"> = {
     contextWindow: 0,
     count: 0,
     maxTokens: 0,
     totalTokens: 0,
 };
+
+function inflationPath(sessionId: string): string {
+    return join(tmpdir(), `pi-compact-trigger-inflation-${sessionId}.json`);
+}
+
+function saveInflationOffset(sessionId: string, offset: number): void {
+    try {
+        writeFileSync(
+            inflationPath(sessionId),
+            JSON.stringify({ sessionId, offset } as InflationRecord) + "\n",
+            "utf-8",
+        );
+    } catch {
+        // ignore
+    }
+}
+
+function loadAndClearInflationOffset(sessionId: string): number | null {
+    try {
+        const path = inflationPath(sessionId);
+        if (existsSync(path)) {
+            const data = JSON.parse(readFileSync(path, "utf-8"));
+            if (data.sessionId === sessionId && typeof data.offset === "number") {
+                try { writeFileSync(path, "\n", "utf-8"); } catch { /* ignore */ }
+                return data.offset;
+            }
+        }
+    } catch {
+        // ignore
+    }
+    return null;
+}
 
 function statsPath(sessionId: string): string {
     return join(tmpdir(), `pi-compact-trigger-${sessionId}.json`);
@@ -116,6 +158,41 @@ function getHeadroom(config: CompactConfig, modelId: string): number {
     return config.headroomTokens;
 }
 
+/**
+ * Get accumulated context tokens — mirrors pi-model-aware-compaction approach.
+ * Primary: ctx.getContextUsage() — Pi's own calculation from session messages.
+ * Fallback: buildSessionContext + estimateTokens from Pi SDK.
+ */
+function getUsedTokens(ctx: ExtensionContext): number | null {
+    // Primary: use Pi's built-in context usage calculator
+    const usage = ctx.getContextUsage();
+    if (usage?.tokens != null)
+        return usage.tokens;
+
+    // Fallback: estimate from session messages using Pi's estimateTokens
+    try {
+        const sessionContext = buildSessionContext(
+            ctx.sessionManager.getEntries(),
+            ctx.sessionManager.getLeafId(),
+        );
+        return sessionContext.messages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+    } catch {
+        return null;
+    }
+}
+
+/** Fallback when turn_end didn't capture a reference (e.g., extension loaded mid-session) */
+function findLastNonErrorAssistantMessage(messages: unknown[]): any | undefined {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const msg = messages[i] as any;
+        if (!msg || msg.role !== "assistant") continue;
+        if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
+        if (!msg.usage) continue;
+        return msg;
+    }
+    return undefined;
+}
+
 function formatNotification(count: number, maxTokens: number, avgTokens: number, contextWindow: number): string {
     return `compact: ${count}x, max ${maxTokens.toLocaleString()} / avg ${Math.round(avgTokens).toLocaleString()} of ${contextWindow.toLocaleString()}`;
 }
@@ -127,42 +204,91 @@ export default function (pi: ExtensionAPI) {
     let lastNudgeMs = 0;
     let sessionId: string | undefined;
 
-    // Pending stats for notification after compaction
+    // Best-effort reference to the last assistant message object used by Pi's internal compaction check
+    let lastAssistantMessageRef: any | undefined;
+
+    // Pending stats for notification after compaction.
+    // Set by session_before_compact — the single source of truth for accurate stats.
     let pendingStats: CompactStats | undefined;
+
+    // Inflation offset from the last turn_end/agent_end inflation.
+    // When we inflate msg.usage.totalTokens, getUsedTokens() includes the inflation
+    // in its count. The offset = forcedTokens - originalTotalTokens. Subtract it
+    // from getUsedTokens() to get the real context usage.
+    let lastInflationOffset: number | undefined;
 
     // -- Session lifecycle -------------------------------------------------------
 
     pi.on("session_start", async (_event, ctx) => {
         sessionId = ctx.sessionManager.getSessionId();
+        lastAssistantMessageRef = undefined;
         lastCompactionMs = 0;
         lastNudgeMs = 0;
         pendingStats = undefined;
+        lastInflationOffset = undefined;
     });
 
     pi.on("session_tree", async (_event, _ctx) => {
+        lastAssistantMessageRef = undefined;
         lastNudgeMs = 0;
         pendingStats = undefined;
+        lastInflationOffset = undefined;
     });
 
-    pi.on("session_compact", async (event, ctx) => {
-        lastCompactionMs = Date.now();
+    pi.on("session_before_compact", async (event, ctx) => {
+        lastAssistantMessageRef = undefined;
         lastNudgeMs = 0;
 
-        const fromExtension = (event as any)?.fromExtension ?? false;
-        const compactionEntry = (event as any)?.compactionEntry;
+        // Single source of truth for stats.
+        // Use ctx.getContextUsage() — Pi's own real-time calculation — for accuracy.
+        // preparation.tokensBefore rebuilds from session entries and can be inflated
+        // by large tool results (e.g. reading session files), producing false estimates.
+        const usedTokens = getUsedTokens(ctx);
+        if (usedTokens == null) return;
+        if (!sessionId) return;
 
-        if (!ctx.hasUI) {
-            pendingStats = undefined;
-            return;
+        const model = ctx.model;
+        if (!model) return;
+
+        const contextWindow = model.contextWindow || DEFAULT_CONTEXT_WINDOW;
+
+        // Record ALL compactions — both self-triggered (via our inflation) and
+        // Pi's internal percentage-based compaction. The threshold check belongs
+        // only in turn_end/agent_end (where we decide whether to inflate).
+        // getUsedTokens() includes the inflation we added to msg.usage.totalTokens.
+        // offset = forcedTokens - originalTotalTokens. Real = reported - offset.
+        let inflationOffset = 0;
+        if (lastInflationOffset != null) {
+            inflationOffset = lastInflationOffset;
+            lastInflationOffset = undefined;
+        } else if (sessionId) {
+            const fileOffset = loadAndClearInflationOffset(sessionId);
+            if (fileOffset != null) inflationOffset = fileOffset;
         }
 
-        try {
-            if (fromExtension && pendingStats) {
-                // This compaction was triggered by THIS plugin — use our own token count
-                // captured at trigger time. Do NOT use compactionEntry.tokensBefore here,
-                // because by the time session_compact fires, the context has been inflated
-                // to ctx+1 (the plugin forced it), so tokensBefore is artificially high.
-                const tokensBefore = pendingStats.maxTokens;
+        const realUsedTokens = Math.max(0, usedTokens - inflationOffset);
+
+        let stats = loadStats(sessionId);
+        if (stats.contextWindow !== contextWindow) {
+            stats = { modelId: model.id, contextWindow, count: 0, maxTokens: 0, totalTokens: 0 };
+        }
+        stats.modelId = model.id;
+        stats.count += 1;
+        stats.maxTokens = Math.max(stats.maxTokens, realUsedTokens);
+        stats.totalTokens += realUsedTokens;
+        saveStats(sessionId, stats);
+
+        // Queue notification for session_compact
+        pendingStats = { ...stats };
+    });
+
+    pi.on("session_compact", async (_event, ctx) => {
+        lastCompactionMs = Date.now();
+        lastAssistantMessageRef = undefined;
+        lastNudgeMs = 0;
+
+        if (pendingStats && ctx.hasUI) {
+            try {
                 const avg = pendingStats.count > 0
                     ? pendingStats.totalTokens / pendingStats.count
                     : 0;
@@ -170,85 +296,93 @@ export default function (pi: ExtensionAPI) {
                     "compact-trigger",
                     formatNotification(
                         pendingStats.count,
-                        tokensBefore,
+                        pendingStats.maxTokens,
                         avg,
                         pendingStats.contextWindow,
                     ),
                 );
-            } else if (!fromExtension) {
-                // Overflow compaction (not triggered by us) — use what Pi reports
-                const tokensBefore = compactionEntry?.tokensBefore;
-                if (tokensBefore) {
-                    ctx.ui.setStatus(
-                        "compact-trigger",
-                        `compact: overflow at ${tokensBefore.toLocaleString()} tokens`,
-                    );
-                }
+            } catch {
+                // ignore UI errors
             }
-        } catch {
-            // ignore UI errors
         }
         pendingStats = undefined;
     });
 
-    // Main trigger logic — runs after EVERY assistant message (including tool-use responses).
-    // Previously used agent_end which only fires when the agent loop exits.
-    // With agent_end, tool-use responses (stopReason: "toolUse") were never checked because
-    // the loop continued to execute tools and agent_end never fired for that turn.
+    // turn_end: fires after EVERY assistant message (including tool-use responses).
+    // Captures the message ref AND checks context for inflation trigger.
+    // This catches context growth during tool-use loops before overflow.
     pi.on("turn_end", async (event, ctx) => {
-        const msg = (event as any)?.message;
+        const msg = event?.message;
         if (!msg || msg.role !== "assistant") return;
         if (msg.stopReason === "error" || msg.stopReason === "aborted") return;
-        if (!msg.usage?.totalTokens) return;
+        if (!msg.usage) return;
 
-        const now = Date.now();
-        if (now - lastCompactionMs < COMPACTION_COOLDOWN_MS) {
-            return;
-        }
+        // Capture reference for inflation
+        lastAssistantMessageRef = msg;
 
         const model = ctx.model;
         if (!model) return;
+
+        const now = Date.now();
+        if (now - lastCompactionMs < COMPACTION_COOLDOWN_MS) return;
 
         const contextWindow = model.contextWindow || DEFAULT_CONTEXT_WINDOW;
         const headroom = getHeadroom(config, model.id);
         const threshold = contextWindow - headroom;
 
-        const usedTokens = msg.usage.totalTokens;
-
-        if (usedTokens < threshold) return;
+        // Get actual accumulated context tokens
+        const usedTokens = getUsedTokens(ctx);
+        if (usedTokens == null || usedTokens < threshold) return;
 
         // Nudge cooldown (prevent double-triggering)
         const nudgeNow = Date.now();
         if (nudgeNow - lastNudgeMs < 5000) return;
         lastNudgeMs = nudgeNow;
 
-        // Inflate tokens to force Pi's shouldCompact() to return true
+        // Inflate tokens to force Pi's shouldCompact()
+        const originalTotalTokens = msg.usage.totalTokens ?? 0;
         const forcedTokens = contextWindow + 1;
-        msg.usage.totalTokens = Math.max(msg.usage.totalTokens, forcedTokens);
+        msg.usage.totalTokens = Math.max(originalTotalTokens, forcedTokens);
 
-        if (!sessionId) return;
+        // Remember the inflation offset so session_before_compact can subtract it
+        // from getUsedTokens() to get real usage.
+        const inflationOffset = forcedTokens - originalTotalTokens;
+        lastInflationOffset = inflationOffset;
+        if (sessionId) saveInflationOffset(sessionId, inflationOffset);
+    });
 
-        // Update and persist stats (per-session)
-        let stats = loadStats(sessionId);
+    // agent_end: final check when the agent loop exits.
+    // Uses event.messages (full array) as fallback if turn_end didn't capture the ref.
+    pi.on("agent_end", async (event, ctx) => {
+        const model = ctx.model;
+        if (!model) return;
 
-        // Reset per-model stats if model/contextWindow changed
-        if (stats.contextWindow !== contextWindow) {
-            stats = {
-                modelId: model.id,
-                contextWindow,
-                count: 0,
-                maxTokens: 0,
-                totalTokens: 0,
-            };
-        }
+        const now = Date.now();
+        if (now - lastCompactionMs < COMPACTION_COOLDOWN_MS) return;
 
-        stats.modelId = model.id;
-        stats.count += 1;
-        stats.maxTokens = Math.max(stats.maxTokens, usedTokens);
-        stats.totalTokens += usedTokens;
-        saveStats(sessionId, stats);
+        const contextWindow = model.contextWindow || DEFAULT_CONTEXT_WINDOW;
+        const headroom = getHeadroom(config, model.id);
+        const threshold = contextWindow - headroom;
 
-        // Queue notification for session_compact
-        pendingStats = { ...stats };
+        const usedTokens = getUsedTokens(ctx);
+        if (usedTokens == null || usedTokens < threshold) return;
+
+        const nudgeNow = Date.now();
+        if (nudgeNow - lastNudgeMs < 5000) return;
+        lastNudgeMs = nudgeNow;
+
+        // Inflate last assistant message's totalTokens
+        const lastAssistant =
+            lastAssistantMessageRef ?? findLastNonErrorAssistantMessage((event as any)?.messages ?? []);
+        if (!lastAssistant) return;
+
+        const originalTotalTokens = lastAssistant.usage.totalTokens ?? 0;
+        const forcedTokens = contextWindow + 1;
+        lastAssistant.usage.totalTokens = Math.max(originalTotalTokens, forcedTokens);
+
+        // Remember the inflation offset (same reason as turn_end)
+        const inflationOffset = forcedTokens - originalTotalTokens;
+        lastInflationOffset = inflationOffset;
+        if (sessionId) saveInflationOffset(sessionId, inflationOffset);
     });
 }
