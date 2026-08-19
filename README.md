@@ -1,6 +1,6 @@
 # pi-compact-trigger
 
-**This is coded after misconfiguring and misunderstanding how pi compation works. Only valid use for this expansion is if you want to have different headroom for some modelsi.**
+**This is coded after misconfiguring and misunderstanding how pi compation works. Only valid use for this expansion is if you want to have different headroom for some models.**
 
 
 Headroom-based compaction trigger for [Pi](https://github.com/earendil-works/pi-coding-agent), designed to work with the [blackhole](https://github.com/tavasti/pi-blackhole) VCC compaction engine.
